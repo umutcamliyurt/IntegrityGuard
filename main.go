@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha512"
+	"database/sql"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -15,15 +15,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
-	"unsafe"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/term"
+	_ "modernc.org/sqlite"
 )
 
 const fileVersion byte = 2
@@ -80,16 +79,6 @@ func zeroBytes(b []byte) {
 	}
 }
 
-func scrubString(s *string) {
-	if s == nil || *s == "" {
-		return
-	}
-	data := unsafe.Slice(unsafe.StringData(*s), len(*s))
-	for i := range data {
-		data[i] = 0
-	}
-	*s = ""
-}
 
 func validatePasswordStrength(password []byte) error {
 	if len(password) < minPasswordLength {
@@ -306,25 +295,157 @@ func atomicWriteFile(filePath string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled bool, yubikeySlot int) (map[string]string, error) {
+func buildHashesDatabase(hashes map[string]string, createdAt time.Time) ([]byte, error) {
+	tmpFile, err := os.CreateTemp("", "hashdb-*.sqlite")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp database file: %v", err)
+	}
+	dbPath := tmpFile.Name()
+	tmpFile.Close()
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-journal")
+		os.Remove(dbPath + "-wal")
+		os.Remove(dbPath + "-shm")
+	}()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open temp database: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+		CREATE TABLE hashes (path_hex TEXT PRIMARY KEY, hash TEXT NOT NULL);
+	`); err != nil {
+		return nil, fmt.Errorf("failed to create database schema: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO metadata (key, value) VALUES ('created_at', ?), ('file_count', ?)`,
+		createdAt.UTC().Format(time.RFC3339Nano), fmt.Sprintf("%d", len(hashes))); err != nil {
+		return nil, fmt.Errorf("failed to write database metadata: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO hashes (path_hex, hash) VALUES (?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to prepare insert statement: %v", err)
+	}
+	for path, hash := range hashes {
+		if _, err := stmt.Exec(hex.EncodeToString([]byte(path)), hash); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return nil, fmt.Errorf("failed to insert hash row: %v", err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return nil, fmt.Errorf("failed to compact database: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close database: %v", err)
+	}
+	db = nil
+
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read serialized database: %v", err)
+	}
+	return data, nil
+}
+
+func loadHashesDatabase(data []byte) (map[string]string, time.Time, error) {
+	tmpFile, err := os.CreateTemp("", "hashdb-*.sqlite")
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to create temp database file: %v", err)
+	}
+	dbPath := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(dbPath)
+		return nil, time.Time{}, fmt.Errorf("failed to write temp database file: %v", err)
+	}
+	tmpFile.Close()
+	defer func() {
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-journal")
+		os.Remove(dbPath + "-wal")
+		os.Remove(dbPath + "-shm")
+	}()
+
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	var createdAtStr string
+	if err := db.QueryRow(`SELECT value FROM metadata WHERE key = 'created_at'`).Scan(&createdAtStr); err != nil {
+		return nil, time.Time{}, fmt.Errorf("hash database is corrupt or missing metadata: %v", err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("hash database has an invalid creation timestamp: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT path_hex, hash FROM hashes`)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to read hashes from database: %v", err)
+	}
+	defer rows.Close()
+
+	storedHashes := make(map[string]string)
+	for rows.Next() {
+		var pathHex, hash string
+		if err := rows.Scan(&pathHex, &hash); err != nil {
+			return nil, time.Time{}, fmt.Errorf("failed to scan hash row: %v", err)
+		}
+		if len(hash) != sha512HexLen {
+			continue
+		}
+		pathBytes, err := hex.DecodeString(pathHex)
+		if err != nil {
+			continue
+		}
+		storedHashes[string(pathBytes)] = hash
+	}
+	if err := rows.Err(); err != nil {
+		return nil, time.Time{}, err
+	}
+
+	return storedHashes, createdAt, nil
+}
+
+func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled bool, yubikeySlot int) (map[string]string, time.Time, error) {
 	raw, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 
 	if len(raw) < 2+16 {
-		return nil, fmt.Errorf("hash file is corrupt or truncated")
+		return nil, time.Time{}, fmt.Errorf("hash file is corrupt or truncated")
 	}
 
 	version := raw[0]
 	if version != fileVersion {
-		return nil, fmt.Errorf("unsupported or tampered hash file version %d (expected %d)", version, fileVersion)
+		return nil, time.Time{}, fmt.Errorf("unsupported or tampered hash file version %d (expected %d)", version, fileVersion)
 	}
 
 	flags := raw[1]
 	fileHasYubikey := flags&flagYubikey != 0
 	if fileHasYubikey != yubikeyEnabled {
-		return nil, fmt.Errorf("yubikey requirement mismatch: this hash file was created with --yubikey=%v; refusing to proceed with a different setting", fileHasYubikey)
+		return nil, time.Time{}, fmt.Errorf("yubikey requirement mismatch: this hash file was created with --yubikey=%v; refusing to proceed with a different setting", fileHasYubikey)
 	}
 
 	offset := 2
@@ -334,7 +455,7 @@ func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled b
 	var challenge []byte
 	if fileHasYubikey {
 		if len(raw) < offset+yubikeyChallengeSize {
-			return nil, fmt.Errorf("hash file is corrupt or truncated")
+			return nil, time.Time{}, fmt.Errorf("hash file is corrupt or truncated")
 		}
 		challenge = raw[offset : offset+yubikeyChallengeSize]
 		offset += yubikeyChallengeSize
@@ -344,7 +465,7 @@ func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled b
 
 	secret, err := deriveSecret(password, yubikeyEnabled, yubikeySlot, challenge)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer zeroBytes(secret)
 
@@ -353,17 +474,17 @@ func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled b
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 
 	nonceSize := gcm.NonceSize()
 	if len(raw) < offset+nonceSize {
-		return nil, fmt.Errorf("hash file is corrupt or truncated")
+		return nil, time.Time{}, fmt.Errorf("hash file is corrupt or truncated")
 	}
 
 	nonce := raw[offset : offset+nonceSize]
@@ -372,33 +493,16 @@ func DecryptFileAndLoadHashes(filePath string, password []byte, yubikeyEnabled b
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, header)
 	if err != nil {
-		return nil, fmt.Errorf("decryption failed: wrong password/yubikey response, or the hash file has been tampered with: %v", err)
+		return nil, time.Time{}, fmt.Errorf("decryption failed: wrong password/yubikey response, or the hash file has been tampered with: %v", err)
 	}
 	defer zeroBytes(plaintext)
 
-	storedHashes := make(map[string]string)
-	scanner := bufio.NewScanner(bytes.NewReader(plaintext))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			continue
-		}
-		hash := parts[0]
-		if len(hash) != sha512HexLen {
-			continue
-		}
-		pathBytes, err := hex.DecodeString(parts[1])
-		if err != nil {
-			continue
-		}
-		storedHashes[string(pathBytes)] = hash
+	storedHashes, createdAt, err := loadHashesDatabase(plaintext)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to load hash database (file may be corrupt or tampered): %v", err)
 	}
 
-	return storedHashes, scanner.Err()
+	return storedHashes, createdAt, nil
 }
 
 type fileEntry struct {
@@ -461,6 +565,9 @@ func HashAllFilesInDirectory(rootDir string, verbose bool, workers int) (map[str
 			defer wg.Done()
 			for e := range jobs {
 				hash, herr := HashFile(e.absPath)
+				if herr != nil {
+					herr = fmt.Errorf("%s: %w", e.relPath, herr)
+				}
 				results <- result{relPath: e.relPath, hash: hash, err: herr}
 			}
 		}()
@@ -575,7 +682,6 @@ func main() {
 	var password []byte
 	if *passwordFlag != "" {
 		password = []byte(*passwordFlag)
-		scrubString(passwordFlag)
 	} else {
 		pw, err := readPasswordFromTerminal(!*checkIntegrity)
 		if err != nil {
@@ -609,36 +715,34 @@ func main() {
 			return
 		}
 
-		keys := make([]string, 0, len(storedHashes))
-		for file := range storedHashes {
-			keys = append(keys, file)
-		}
-		sort.Strings(keys)
+		createdAt := time.Now()
 
-		var hashString strings.Builder
-		for _, file := range keys {
-			if _, err := fmt.Fprintf(&hashString, "%s %s\n", storedHashes[file], hex.EncodeToString([]byte(file))); err != nil {
-				fmt.Printf("Error writing hash data: %v\n", err)
-				return
-			}
+		dbBytes, err := buildHashesDatabase(storedHashes, createdAt)
+		if err != nil {
+			fmt.Printf("Error building hash database: %v\n", err)
+			return
 		}
 
-		if err := EncryptAndWriteToFile([]byte(hashString.String()), hashFilePath, password, *yubikeyEnabled, *yubikeySlot); err != nil {
+		if err := EncryptAndWriteToFile(dbBytes, hashFilePath, password, *yubikeyEnabled, *yubikeySlot); err != nil {
 			fmt.Printf("Error encrypting and writing to the hash file: %v\n", err)
 			return
 		}
 
 		fmt.Printf("Hashes stored in %s\n", hashFilePath)
+		fmt.Printf("Database created at: %s\n", createdAt.Local().Format("2006-01-02 15:04:05 MST"))
+		fmt.Println("This timestamp is sealed inside the encrypted file; any tampering with it (or any other byte) will cause the integrity check to reject the file.")
 		if *yubikeyEnabled {
 			fmt.Printf("This database now requires the same YubiKey (slot %d) to verify integrity.\n", *yubikeySlot)
 			fmt.Println("Keep a backup YubiKey configured with the same secret in case this one is lost or destroyed.")
 		}
 	} else {
-		storedHashes, err := DecryptFileAndLoadHashes(hashFilePath, password, *yubikeyEnabled, *yubikeySlot)
+		storedHashes, createdAt, err := DecryptFileAndLoadHashes(hashFilePath, password, *yubikeyEnabled, *yubikeySlot)
 		if err != nil {
 			fmt.Printf("Error decrypting and loading stored hashes: %v\n", err)
 			return
 		}
+
+		fmt.Printf("Database created at: %s\n", createdAt.Local().Format("2006-01-02 15:04:05 MST"))
 
 		recalculatedHashes, err := HashAllFilesInDirectory(rootDirClean, *verbose, *workers)
 		if err != nil {

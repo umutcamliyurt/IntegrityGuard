@@ -73,6 +73,8 @@ Confirm password:
 [========================================] 2698/2698
 Waiting for YubiKey response (touch the device now if it requires confirmation)...
 Hashes stored in /home/user/Documents.hashes.enc
+Database created at: 2026-07-09 20:45:18 +03
+This timestamp is sealed inside the encrypted file; any tampering with it (or any other byte) will cause the integrity check to reject the file.
 This database now requires the same YubiKey (slot 2) to verify integrity.
 Keep a backup YubiKey configured with the same secret in case this one is lost or destroyed.
 ```
@@ -84,6 +86,7 @@ Keep a backup YubiKey configured with the same secret in case this one is lost o
 ./IntegrityGuard -yubikey -dir Documents -check
 Enter password: 
 Waiting for YubiKey response (touch the device now if it requires confirmation)...
+Database created at: 2026-07-09 20:45:18 +03
 [========================================] 2698/2698
 Integrity check successful. All files are verified. ✔️
 ```
@@ -93,6 +96,7 @@ Integrity check successful. All files are verified. ✔️
 ./IntegrityGuard -yubikey -dir Documents -check
 Enter password: 
 Waiting for YubiKey response (touch the device now if it requires confirmation)...
+Database created at: 2026-07-09 20:45:18 +03
 [========================================] 2698/2698
 Integrity check failed for: Customer_Database_Export.pdf
 New file detected: Legal/Contracts/Agreement.txt
